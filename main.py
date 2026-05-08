@@ -26,31 +26,29 @@ def bandpass_filter(signal, fs, low=0.7, high=3.5, order=4):
 def check_finger_contact(raw_signal: list) -> tuple[bool, str]:
     """
     Detect if a finger is actually covering the camera lens.
-    A covered lens shows:
-      1. High red channel mean (>150 out of 255) — flesh is red/pink
-      2. Low green and blue means — finger blocks other wavelengths
-      3. Low variance in brightness overall — steady contact
+    Relaxed thresholds to accommodate different phone cameras and skin tones.
     """
     signal = np.array(raw_signal)
 
-    # Check 1: Mean red value must be high (finger blocks the lens, looks red/pink)
     mean_val = float(np.mean(signal))
-    if mean_val < 150:
+
+    # RELAXED: was 150 — many valid readings (darker skin tones, older phones) fall below this
+    if mean_val < 80:
         return False, (
             f"No finger detected (brightness={mean_val:.0f}). "
             "Press your fingertip firmly over the camera lens and flashlight."
         )
 
-    # Check 2: Signal must not be too flat (all-white/saturated = no finger, just light)
+    # Saturation check — unchanged, this is a hard ceiling
     if mean_val > 252:
         return False, (
             "Camera appears fully saturated. "
             "Cover the lens completely with your fingertip — don't just hold it nearby."
         )
 
-    # Check 3: There must be meaningful AC variation (heartbeat creates ~1-3% fluctuation)
+    # RELAXED: was 0.3 — low-variance signals can still carry a valid pulse
     ac_component = float(np.std(signal))
-    if ac_component < 0.3:
+    if ac_component < 0.1:
         return False, (
             "Signal too flat — no pulse detected. "
             "Press your fingertip more firmly over the camera lens."
@@ -62,10 +60,11 @@ def check_finger_contact(raw_signal: list) -> tuple[bool, str]:
 def check_signal_stationarity(raw_signal: list) -> tuple[bool, str]:
     """Check that the signal doesn't have huge jumps (finger lifted mid-recording)."""
     signal = np.array(raw_signal)
-    # Split into 4 chunks and check mean doesn't vary wildly
     chunks = np.array_split(signal, 4)
     means = [np.mean(c) for c in chunks]
-    if max(means) - min(means) > 40:
+
+    # RELAXED: was 40 — allows for mild finger shifts without rejecting the whole reading
+    if max(means) - min(means) > 70:
         return False, (
             "Signal unstable — finger was lifted or moved during recording. "
             "Keep your fingertip still and pressed firmly over the lens for the full duration."
@@ -112,8 +111,9 @@ def process_video_file(video_path: str, target_fps: int = 30):
         raw_red.append(float(np.mean(roi[:, :, 2])))
     cap.release()
 
-    if len(raw_red) < target_fps * 5:
-        raise ValueError("Video too short — needs at least 5 seconds of recording.")
+    # RELAXED: was 5 seconds — allow slightly shorter recordings
+    if len(raw_red) < target_fps * 4:
+        raise ValueError("Video too short — needs at least 4 seconds of recording.")
 
     # --- Finger contact checks ---
     ok, msg = check_finger_contact(raw_red)
@@ -124,12 +124,13 @@ def process_video_file(video_path: str, target_fps: int = 30):
     if not ok:
         raise ValueError(msg)
 
-    # --- Additional channel check: finger makes red >> green/blue ---
+    # --- Channel dominance check ---
     mean_red = np.mean(raw_red)
     mean_green = np.mean(raw_green)
     mean_blue = np.mean(raw_blue)
 
-    if mean_red < mean_green + 20:
+    # RELAXED: was mean_green + 20 — some cameras and skin tones have tighter channel separation
+    if mean_red < mean_green:
         raise ValueError(
             "No finger detected — red channel not dominant. "
             "Place your fingertip directly over the camera lens and flashlight."
@@ -145,7 +146,9 @@ def process_video_file(video_path: str, target_fps: int = 30):
 
     # Adaptive peak detection based on signal amplitude
     signal_range = np.max(filtered_signal) - np.min(filtered_signal)
-    min_prominence = signal_range * 0.15
+
+    # RELAXED: was 0.15 — lower prominence threshold catches subtler pulse peaks
+    min_prominence = signal_range * 0.08
 
     peaks, props = find_peaks(
         filtered_signal,
@@ -157,10 +160,10 @@ def process_video_file(video_path: str, target_fps: int = 30):
     # Only keep physiologically valid RR intervals (30-200 BPM)
     rr_intervals = rr_intervals[(rr_intervals > 0.3) & (rr_intervals < 2.0)]
 
-    # Quality: check regularity of peaks (real heartbeat is regular)
+    # RELAXED: was 0.35 — healthy HRV and real-world noise can exceed 0.35 legitimately
     if len(rr_intervals) > 2:
         rr_cv = float(np.std(rr_intervals) / np.mean(rr_intervals))
-        if rr_cv > 0.35:
+        if rr_cv > 0.55:
             raise ValueError(
                 "Irregular signal detected — this doesn't look like a heartbeat. "
                 "Press your fingertip firmly and stay still."
@@ -176,7 +179,8 @@ def process_video_file(video_path: str, target_fps: int = 30):
     else:
         waveform = filtered_signal.tolist()
 
-    if len(rr_intervals) >= 5 and signal_quality >= 60:
+    # RELAXED: rr_intervals threshold was 5, quality threshold was 60%
+    if len(rr_intervals) >= 3 and signal_quality >= 40:
         hrv = compute_hrv(rr_intervals)
         hrv["signal_quality_pct"] = round(signal_quality, 1)
         hrv["waveform"] = waveform
