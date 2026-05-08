@@ -5,7 +5,6 @@ import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks, resample
 import tempfile
 import os
-import json
 
 app = FastAPI(title="HRV Analyzer API")
 
@@ -18,10 +17,60 @@ app.add_middleware(
 
 # ---------- Signal Processing ----------
 
-def bandpass_filter(signal, fs, low=0.7, high=3.0, order=4):
+def bandpass_filter(signal, fs, low=0.7, high=3.5, order=4):
     nyq = 0.5 * fs
     b, a = butter(order, [low / nyq, high / nyq], btype="band")
     return filtfilt(b, a, signal)
+
+
+def check_finger_contact(raw_signal: list) -> tuple[bool, str]:
+    """
+    Detect if a finger is actually covering the camera lens.
+    A covered lens shows:
+      1. High red channel mean (>150 out of 255) — flesh is red/pink
+      2. Low green and blue means — finger blocks other wavelengths
+      3. Low variance in brightness overall — steady contact
+    """
+    signal = np.array(raw_signal)
+
+    # Check 1: Mean red value must be high (finger blocks the lens, looks red/pink)
+    mean_val = float(np.mean(signal))
+    if mean_val < 150:
+        return False, (
+            f"No finger detected (brightness={mean_val:.0f}). "
+            "Press your fingertip firmly over the camera lens and flashlight."
+        )
+
+    # Check 2: Signal must not be too flat (all-white/saturated = no finger, just light)
+    if mean_val > 252:
+        return False, (
+            "Camera appears fully saturated. "
+            "Cover the lens completely with your fingertip — don't just hold it nearby."
+        )
+
+    # Check 3: There must be meaningful AC variation (heartbeat creates ~1-3% fluctuation)
+    ac_component = float(np.std(signal))
+    if ac_component < 0.3:
+        return False, (
+            "Signal too flat — no pulse detected. "
+            "Press your fingertip more firmly over the camera lens."
+        )
+
+    return True, "ok"
+
+
+def check_signal_stationarity(raw_signal: list) -> tuple[bool, str]:
+    """Check that the signal doesn't have huge jumps (finger lifted mid-recording)."""
+    signal = np.array(raw_signal)
+    # Split into 4 chunks and check mean doesn't vary wildly
+    chunks = np.array_split(signal, 4)
+    means = [np.mean(c) for c in chunks]
+    if max(means) - min(means) > 40:
+        return False, (
+            "Signal unstable — finger was lifted or moved during recording. "
+            "Keep your fingertip still and pressed firmly over the lens for the full duration."
+        )
+    return True, "ok"
 
 
 def compute_hrv(rr_intervals):
@@ -47,7 +96,10 @@ def process_video_file(video_path: str, target_fps: int = 30):
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    raw_signal = []
+
+    raw_red = []
+    raw_green = []
+    raw_blue = []
 
     while True:
         ret, frame = cap.read()
@@ -55,43 +107,84 @@ def process_video_file(video_path: str, target_fps: int = 30):
             break
         h, w, _ = frame.shape
         roi = frame[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
-        red_avg = float(np.mean(roi[:, :, 2]))
-        raw_signal.append(red_avg)
+        raw_blue.append(float(np.mean(roi[:, :, 0])))
+        raw_green.append(float(np.mean(roi[:, :, 1])))
+        raw_red.append(float(np.mean(roi[:, :, 2])))
     cap.release()
 
-    if len(raw_signal) < target_fps * 3:
-        raise ValueError("Video too short — needs at least 3 seconds")
+    if len(raw_red) < target_fps * 5:
+        raise ValueError("Video too short — needs at least 5 seconds of recording.")
 
+    # --- Finger contact checks ---
+    ok, msg = check_finger_contact(raw_red)
+    if not ok:
+        raise ValueError(msg)
+
+    ok, msg = check_signal_stationarity(raw_red)
+    if not ok:
+        raise ValueError(msg)
+
+    # --- Additional channel check: finger makes red >> green/blue ---
+    mean_red = np.mean(raw_red)
+    mean_green = np.mean(raw_green)
+    mean_blue = np.mean(raw_blue)
+
+    if mean_red < mean_green + 20:
+        raise ValueError(
+            "No finger detected — red channel not dominant. "
+            "Place your fingertip directly over the camera lens and flashlight."
+        )
+
+    # --- Signal processing ---
     duration = total_frames / fps
     target_frames = int(duration * target_fps)
-    resampled_signal = resample(raw_signal, target_frames)
+    resampled_signal = resample(raw_red, target_frames)
     resampled_time = np.linspace(0, duration, target_frames)
 
     filtered_signal = bandpass_filter(resampled_signal, target_fps)
 
-    peaks, _ = find_peaks(filtered_signal, distance=target_fps * 0.4)
+    # Adaptive peak detection based on signal amplitude
+    signal_range = np.max(filtered_signal) - np.min(filtered_signal)
+    min_prominence = signal_range * 0.15
+
+    peaks, props = find_peaks(
+        filtered_signal,
+        distance=int(target_fps * 0.35),   # max ~170 BPM
+        prominence=min_prominence,
+    )
+
     rr_intervals = np.diff(resampled_time[peaks])
+    # Only keep physiologically valid RR intervals (30-200 BPM)
     rr_intervals = rr_intervals[(rr_intervals > 0.3) & (rr_intervals < 2.0)]
 
-    expected_peaks = int(duration / 0.8)
+    # Quality: check regularity of peaks (real heartbeat is regular)
+    if len(rr_intervals) > 2:
+        rr_cv = float(np.std(rr_intervals) / np.mean(rr_intervals))
+        if rr_cv > 0.35:
+            raise ValueError(
+                "Irregular signal detected — this doesn't look like a heartbeat. "
+                "Press your fingertip firmly and stay still."
+            )
+
+    expected_peaks = int(duration / 0.75)
     signal_quality = min(100.0, (len(peaks) / max(expected_peaks, 1)) * 100)
 
-    # Downsample waveform to ~200 points for the app
+    # Waveform for display
     waveform_points = 200
     if len(filtered_signal) > waveform_points:
         waveform = resample(filtered_signal, waveform_points).tolist()
     else:
         waveform = filtered_signal.tolist()
 
-    if len(rr_intervals) > 3 and signal_quality >= 50:
+    if len(rr_intervals) >= 5 and signal_quality >= 60:
         hrv = compute_hrv(rr_intervals)
         hrv["signal_quality_pct"] = round(signal_quality, 1)
         hrv["waveform"] = waveform
         return hrv
     else:
         raise ValueError(
-            f"Low signal quality ({signal_quality:.0f}%). "
-            "Ensure fingertip covers the camera lens fully and there is good lighting."
+            f"Could not detect enough heartbeats (quality={signal_quality:.0f}%). "
+            "Ensure your fingertip covers the camera lens fully, the flash is on, and stay still."
         )
 
 
@@ -104,7 +197,6 @@ def health():
 
 @app.post("/analyze")
 async def analyze(video: UploadFile = File(...)):
-    # Validate file type
     if not video.filename.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
         raise HTTPException(400, "Unsupported file type. Send MP4, MOV, AVI, or MKV.")
 
